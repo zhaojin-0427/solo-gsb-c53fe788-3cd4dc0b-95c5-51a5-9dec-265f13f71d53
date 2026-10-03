@@ -23,7 +23,7 @@
 | 字节一致 / ETag | 同一 revision + 同一瓦片坐标，重复请求**字节完全相同、ETag 相同**；已编译瓦片持久化到 SQLite |
 | 条件请求 | 支持 `If-None-Match`，命中时返回 **304 Not Modified** |
 | 错误处理 | 非法 GeoJSON / 非法几何 / 无效瓦片参数返回 **400**，数据集或版本不存在返回 **404** |
-| 一键启动 | 提供 `Dockerfile` 与 `docker-compose.yml`，数据持久化在命名卷中；两个 worker 在全新卷上同时建库由文件锁 + 有界重试串行化，两者都会完整启动（见 [§3.2](#32-全新数据卷初始化竞态复核)） |
+| 一键启动 | 提供 `Dockerfile` 与 `docker-compose.yml`，数据持久化在命名卷中；两个 worker 在全新卷上同时建库由**非阻塞**文件锁 + 有界重试串行化，两者都会完整启动（见 [§3.2](#32-全新数据卷初始化竞态复核)）；另有进程持续占锁时启动会**在退避预算内明确失败退出而不是悬挂**，解锁后可正常启动（见 [§3.3](#33-持锁--解锁启动复核docker-compose)） |
 
 ---
 
@@ -36,10 +36,12 @@
 │   ├── tiler.py         # 裁剪 / 简化 / 量化 / 稳定排序 / MVT 编码
 │   ├── projection.py    # EPSG:4326 -> Web Mercator -> 瓦片 4096 网格
 │   ├── geojson.py       # GeoJSON 校验与规范化
-│   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache，跨进程建库锁与事务）
+│   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache，非阻塞跨进程建库锁与事务）
 │   └── config.py        # 环境变量配置
 ├── data/sample.geojson  # 示例图层（点 / 线 / 面）
-├── tests/               # pytest 测试（60 个用例，含初始化竞态与跨进程追加发布竞态回归）
+├── scripts/
+│   └── hold_init_lock.py # 持锁复核辅助：独占 <db>.init.lock（可定时释放）
+├── tests/               # pytest 测试（65 个用例，含非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -63,6 +65,10 @@ docker compose up -d --build
   SQLite 文件；**首次启动建库由跨进程文件锁串行化、并带有界重试**（见
   [§3.2](#32-全新数据卷初始化竞态复核)），跨进程的追加发布则由 `BEGIN IMMEDIATE`
   事务串行化，可直接按 [§4.2](#42-发布新版本乐观并发控制) 末尾的并发命令复核竞态
+- 若**另一个进程持续持有** `/data/tiles.db.init.lock` 排他锁，worker 不会无限等待：
+  取锁是**非阻塞尝试**，失败后与 SQLite 忙锁共用同一份重试 / 退避预算，预算耗尽即抛
+  `SchemaUnavailable` 明确结束启动；持锁进程释放后重启即可正常建库。可用
+  Compose 一键复核，见 [§3.3](#33-持锁--解锁启动复核docker-compose)
 
 常用命令：
 
@@ -98,9 +104,14 @@ export VT_DB_PATH=./data/tiles.db          # SQLite 文件路径
 两个 worker 在全新卷上同时执行 lifespan 建库时，`PRAGMA busy_timeout` 会在
 `PRAGMA journal_mode=WAL` **之前**安装；建库 DDL 全部使用
 `CREATE TABLE/INDEX IF NOT EXISTS`，并由容器内 `/data/tiles.db.init.lock` 上的
-排他文件锁（`flock`）串行化，外加最多 8 次、指数退避（0.1 s 起，上限 2 s）的有界
-重试，最后重新打开连接复核 WAL 模式与全部 schema 对象均可见。因此两个 worker 都会
-完整启动、建同一份 schema 且不重复建表。
+排他文件锁（`flock`）串行化。取锁使用 **`LOCK_EX | LOCK_NB` 非阻塞尝试**：抢不到锁
+（例如另一个进程正在建库、或持锁不放）时立即抛 `InitLockUnavailable`，与 SQLite 的
+`database is locked` 忙错误**共用同一份**最多 8 次、指数退避（0.1 s 起，上限 2 s）的
+有界预算；抢到锁的进程仍串行建库，且 DDL 异常时在 `finally` 中释放已获取的锁。最后
+重新打开连接复核 WAL 模式与全部 schema 对象均可见。因此两个 worker 都会完整启动、建同
+一份 schema 且不重复建表；而一个**持续不放锁的外部进程**只会让启动在预算内重试后退
+出（见 [§3.3](#33-持锁--解锁启动复核docker-compose)），绝不会卡在阻塞式 `flock` 里
+悬挂。
 
 **第 1 步：在全新数据卷上一键启动**（`down -v` 确保卷是空的）：
 
@@ -208,6 +219,141 @@ round 3: healthz=200 locked_errors=0
 初始化相关参数也可以用环境变量调整（见 [§7](#7-配置环境变量)）：
 `VT_SQLITE_BUSY_TIMEOUT_MS`（默认 30000）、`VT_INIT_MAX_ATTEMPTS`（默认 8）、
 `VT_INIT_RETRY_DELAY_S`（默认 0.1）。
+
+### 3.3 持锁 / 解锁启动复核（Docker Compose）
+
+本节复核修复点：**另一个进程持续持有 `tiles.db.init.lock` 排他锁时，启动不能悬挂**。
+worker 的取锁为非阻塞尝试，与 SQLite 忙锁共用 `VT_INIT_MAX_ATTEMPTS` / 退避预算；预算
+内锁被释放则两个 worker 串行建库、`/healthz` 返回 200；锁一直不释放则明确抛
+`SchemaUnavailable` 并结束启动，容器进入重启退避而不是无限等待。
+
+Compose 提供一个独立的 `init-lock-holder` 服务（放在 `locktest` profile 中，
+**普通 `docker compose up` 不会启动它**），它用 `scripts/hold_init_lock.py` 抢同一把
+`/data/tiles.db.init.lock` 排他锁：不带秒数时持续持锁直到被 `stop`，带秒数时到时自动
+释放（用于复核“预算内释放”）。
+
+**第 1 步：全新卷 + 先启动持锁者，再启动 API（持续占锁）**
+
+```bash
+docker compose down -v
+docker compose --profile locktest up -d init-lock-holder
+docker compose logs init-lock-holder
+# vt-init-lock-holder  | holding exclusive lock on /data/tiles.db.init.lock until stopped
+docker compose up -d vector-tiles
+```
+
+**第 2 步：确认 worker 在退避预算内重试后明确失败，而不是悬挂**
+
+```bash
+sleep 10
+docker compose logs vector-tiles | grep -E "init_db attempt|SchemaUnavailable|startup failed" | head -20
+```
+
+预期日志（每个 worker 先按 0.1 s、0.2 s、0.4 s 退避重试，预算耗尽即抛
+`SchemaUnavailable` 并结束启动）：
+
+```text
+WARNING:  init_db attempt 1/8 failed (init lock is held by another process: /data/tiles.db.init.lock); retrying in 0.10s
+WARNING:  init_db attempt 2/8 failed (init lock is held by another process: /data/tiles.db.init.lock); retrying in 0.20s
+WARNING:  init_db attempt 3/8 failed (init lock is held by another process: /data/tiles.db.init.lock); retrying in 0.40s
+ERROR:    init_db gave up after 8 attempts: init lock is held by another process: /data/tiles.db.init.lock
+app.db.SchemaUnavailable: database initialisation failed after 8 attempts: init lock is held by another process: /data/tiles.db.init.lock
+ERROR:    Application startup failed. Exiting.
+```
+
+此时端口尚未提供服务，健康检查不通（**不会有任何请求悬挂**）：
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" --max-time 3 http://localhost:8000/healthz || echo "connection refused (startup not complete)"
+```
+
+```text
+000
+connection refused (startup not complete)
+```
+
+容器状态表现为反复重启（`restart: unless-stopped`），但每次启动都是有界的：
+
+```bash
+docker compose ps vector-tiles
+# NAME                      ... STATUS
+# offline-vector-tile-api   ... Restarting (...)
+```
+
+**第 3 步：释放锁并重启——两个 worker 串行建好同一份完整 schema，/healthz 返回 200**
+
+```bash
+docker compose stop init-lock-holder
+docker compose restart vector-tiles
+sleep 5
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w "%{http_code} " http://localhost:8000/healthz
+done; echo
+```
+
+```text
+200 200 200 200 200 200 200 200 200 200
+```
+
+```bash
+docker compose logs vector-tiles | grep -E "Started server process|Application startup complete"
+```
+
+```text
+INFO:     Started server process [10]
+INFO:     Application startup complete.
+INFO:     Started server process [11]
+INFO:     Application startup complete.
+```
+
+两个 worker 看到的是同一份完整 schema（WAL + 三张表 + 索引，各只定义一次），
+检查命令与输出与 [§3.2 第 4 步](#32-全新数据卷初始化竞态复核) 相同：
+
+```text
+journal_mode = wal
+index idx_tile_cache_rev
+table datasets
+table revisions
+table tile_cache
+duplicate objects: []
+```
+
+**第 4 步（可选）：预算内自动释放——worker 重试若干次后在锁释放时直接建库成功**
+
+把持锁者换成“持锁 2 秒后自动释放”（`run` 覆盖 `command` 追加秒数；注意
+`--profile` 要放在子命令之前）。默认 8 次重试、退避 0.1→0.2→0.4→0.8→1.6→2.0…
+（累计预算约 7 s）足以覆盖这 2 秒，因此**无需重启 API**：正在重试的 worker 在锁释放
+后抢到锁即可完成启动。
+
+```bash
+docker compose down -v
+docker compose --profile locktest run -d --name vt-lock-timed \
+  init-lock-holder \
+  python scripts/hold_init_lock.py /data/tiles.db.init.lock 2
+docker compose up -d vector-tiles
+sleep 8
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/healthz
+docker compose logs vector-tiles | grep -E "init_db attempt" | wc -l
+docker compose logs vector-tiles | grep -c "Application startup complete"
+```
+
+```text
+200
+# 锁释放前两个 worker 各会出现若干条 init_db attempt 重试警告（具体条数取决于调度，通常 6-10）
+2
+```
+
+重试日志形如：
+
+```text
+WARNING:  init_db attempt 1/8 failed (init lock is held by another process: /data/tiles.db.init.lock); retrying in 0.10s
+WARNING:  init_db attempt 2/8 failed (init lock is held by another process: /data/tiles.db.init.lock); retrying in 0.20s
+WARNING:  init_db attempt 3/8 failed (init lock is held by another process: /data/tiles.db.init.lock); retrying in 0.40s
+...
+INFO:     Application startup complete.
+```
+
+> 复核结束后清理：`docker compose --profile locktest down -v`。
 
 ---
 
@@ -527,5 +673,5 @@ ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务
 | `VT_WORKERS` | `2`（Docker） | uvicorn 工作进程数；多进程共享同一 SQLite 文件，首次建库与追加发布分别由文件锁和跨进程事务串行化 |
 | `VT_TILE_CACHE_SIZE` | `4096` | 进程内瓦片 LRU 缓存条目数 |
 | `VT_SQLITE_BUSY_TIMEOUT_MS` | `30000` | SQLite 忙等待（busy handler）毫秒数；连接建立后、切换 WAL 之前生效 |
-| `VT_INIT_MAX_ATTEMPTS` | `8` | lifespan 建库遇到瞬时锁错误时的有界重试次数 |
-| `VT_INIT_RETRY_DELAY_S` | `0.1` | 建库重试的初始退避秒数（指数翻倍，上限 2 秒） |
+| `VT_INIT_MAX_ATTEMPTS` | `8` | lifespan 建库有界重试次数；SQLite 忙锁与**非阻塞 init 文件锁抢锁失败**共用此预算，耗尽即抛 `SchemaUnavailable` 结束启动 |
+| `VT_INIT_RETRY_DELAY_S` | `0.1` | 建库重试的初始退避秒数（指数翻倍，上限 2 秒），同样作用于文件锁抢锁重试 |

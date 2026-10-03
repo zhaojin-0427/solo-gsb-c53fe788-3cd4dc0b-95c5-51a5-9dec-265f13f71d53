@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application source.
 COPY app ./app
 COPY data ./data
+COPY scripts ./scripts
 
 RUN mkdir -p /data && \
     groupadd --system tiles && \

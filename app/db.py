@@ -1,6 +1,7 @@
 """SQLite persistence for datasets, immutable revisions and the tile cache."""
 from __future__ import annotations
 
+import errno
 import os
 import sqlite3
 import time
@@ -61,6 +62,16 @@ class SchemaUnavailable(Exception):
     """The schema could not be initialised within the bounded retry budget."""
 
 
+class InitLockUnavailable(Exception):
+    """The non-blocking ``.init.lock`` acquisition failed on this attempt.
+
+    Retriable inside ``init_db``: another process currently holds the
+    cross-process initialisation lock.  Only when the shared retry budget is
+    exhausted does this surface to lifespan as ``SchemaUnavailable`` instead of
+    letting the worker hang on a blocking ``flock``.
+    """
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -108,9 +119,15 @@ def _init_file_lock() -> Iterator[None]:
 
     An exclusive ``flock`` on ``<db>.init.lock`` makes the two uvicorn workers
     initialise one after the other instead of racing inside the WAL switch /
-    DDL.  The lock is released automatically on process exit, so a crashed
-    winner can never strand the followers.  Falls back to a no-op on platforms
-    without ``fcntl`` (the idempotent DDL + bounded retry still apply there).
+    DDL.  The lock is taken **non-blocking** (``LOCK_EX | LOCK_NB``): if another
+    process currently holds it, ``InitLockUnavailable`` is raised immediately so
+    ``init_db`` can spend the same bounded attempt/backoff budget used for
+    SQLite busy errors instead of parking the worker forever inside a blocking
+    ``flock`` (which the outer retry loop could never interrupt).  The lock is
+    released on both normal exit and errors in the guarded block, and also
+    automatically on process exit, so a crashed winner can never strand the
+    followers.  Falls back to a no-op on platforms without ``fcntl`` (the
+    idempotent DDL + bounded retry still apply there).
     """
     lock_path = settings.db_path + ".init.lock"
     try:
@@ -119,7 +136,15 @@ def _init_file_lock() -> Iterator[None]:
         yield
         return
     with open(lock_path, "a+") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            # EWOULDBLOCK/EAGAIN: held by another process right now.
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                raise InitLockUnavailable(
+                    f"init lock held by another process: {lock_path}"
+                ) from exc
+            raise
         try:
             yield
         finally:
@@ -153,10 +178,21 @@ def init_db() -> None:
     All DDL uses ``CREATE ... IF NOT EXISTS`` so the second worker simply
     confirms the first worker's result: no table is ever created twice.  The
     whole sequence is additionally guarded by a cross-process file lock and a
-    bounded retry loop -- if a transient ``database is locked`` still occurs
-    (the busy handler budget is exhausted, or an unusually slow peer holds the
-    WAL switch), the worker waits with capped exponential backoff and retries
-    instead of letting lifespan crash.
+    bounded retry loop.  Two distinct transient conditions share the *same*
+    budget of ``init_max_attempts`` with capped exponential backoff:
+
+    * ``database is locked`` -- the SQLite busy handler budget is exhausted or
+      an unusually slow peer holds the WAL switch; and
+    * ``InitLockUnavailable`` -- a peer process currently holds
+      ``<db>.init.lock``; the lock is acquired non-blocking, so this fails fast
+      and retries rather than hanging the worker (and the lifespan) on an
+      uninterruptible blocking ``flock``.
+
+    If an error occurs after the file lock was acquired (connect/DDL/verify),
+    the context manager releases that lock before the retry, so peers are never
+    blocked behind a failed attempt.  When the budget is exhausted with the
+    lock still held elsewhere, ``SchemaUnavailable`` is raised and lifespan
+    startup ends instead of hanging.
     """
     os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
 
@@ -175,14 +211,17 @@ def init_db() -> None:
             with connection() as verify_conn:
                 _assert_db_ready(verify_conn)
             return
+        except InitLockUnavailable as exc:
+            # Another worker/process holds the init lock; retry non-blockingly.
+            last_exc = exc
         except (sqlite3.OperationalError, SchemaUnavailable) as exc:
             last_exc = exc
             if not isinstance(exc, SchemaUnavailable) and not _is_busy_error(exc):
                 raise
-            if attempt >= settings.init_max_attempts:
-                break
-            time.sleep(delay)
-            delay = min(delay * 2, 2.0)
+        if attempt >= settings.init_max_attempts:
+            break
+        time.sleep(delay)
+        delay = min(delay * 2, 2.0)
 
     raise SchemaUnavailable(
         f"database initialisation failed after {settings.init_max_attempts} attempts: {last_exc}"

@@ -54,6 +54,8 @@ class Settings:
     # SQLITE_BUSY immediately when no busy timeout is active yet.
     sqlite_busy_timeout_ms: int = _int("VT_SQLITE_BUSY_TIMEOUT_MS", 30000)
     # Bounded retry/backoff for startup schema initialisation (see db.init_db).
+    # Shared by both transient startup conditions: SQLite "database is locked"
+    # and the non-blocking .init.lock already being held by another process.
     init_max_attempts: int = _int("VT_INIT_MAX_ATTEMPTS", 8)
     init_retry_delay_s: float = _float("VT_INIT_RETRY_DELAY_S", 0.1)
 

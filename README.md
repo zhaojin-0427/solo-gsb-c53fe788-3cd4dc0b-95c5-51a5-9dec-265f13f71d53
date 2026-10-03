@@ -23,7 +23,7 @@
 | 字节一致 / ETag | 同一 revision + 同一瓦片坐标，重复请求**字节完全相同、ETag 相同**；已编译瓦片持久化到 SQLite |
 | 条件请求 | 支持 `If-None-Match`，命中时返回 **304 Not Modified** |
 | 错误处理 | 非法 GeoJSON / 非法几何 / 无效瓦片参数返回 **400**，数据集或版本不存在返回 **404** |
-| 一键启动 | 提供 `Dockerfile` 与 `docker-compose.yml`，数据持久化在命名卷中；两个 worker 在全新卷上同时建库由文件锁 + 有界重试串行化，两者都会完整启动（见 [§3.2](#32-全新数据卷初始化竞态复核)） |
+| 一键启动 | 提供 `Dockerfile` 与 `docker-compose.yml`，数据持久化在命名卷中；两个 worker 在全新卷上同时建库由**非阻塞**文件锁（`flock LOCK_EX \| LOCK_NB`）+ 有界重试串行化——文件锁与 SQLite 忙锁共用同一份 `init_max_attempts` 退避预算，拿不到锁立即重试而不是无限阻塞；锁在预算内释放则两者都会完整启动并看到同一完整 schema，锁被持续占满预算则抛出 `SchemaUnavailable` 明确结束启动（见 [§3.2](#32-全新数据卷初始化竞态复核) 与 [§3.3](#33-持锁与解锁复核)） |
 
 ---
 
@@ -36,10 +36,10 @@
 │   ├── tiler.py         # 裁剪 / 简化 / 量化 / 稳定排序 / MVT 编码
 │   ├── projection.py    # EPSG:4326 -> Web Mercator -> 瓦片 4096 网格
 │   ├── geojson.py       # GeoJSON 校验与规范化
-│   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache，跨进程建库锁与事务）
+│   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache，非阻塞建库锁与跨进程事务）
 │   └── config.py        # 环境变量配置
 ├── data/sample.geojson  # 示例图层（点 / 线 / 面）
-├── tests/               # pytest 测试（60 个用例，含初始化竞态与跨进程追加发布竞态回归）
+├── tests/               # pytest 测试（64 个用例，含非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -60,9 +60,11 @@ docker compose up -d --build
 - 健康检查：<http://localhost:8000/healthz>
 - SQLite 数据库保存在 Docker 命名卷 `tile-data`（容器内 `/data/tiles.db`），容器重建后数据不丢
 - 默认以 **2 个 uvicorn worker 进程**启动（`VT_WORKERS=2`），两个进程共享同一个
-  SQLite 文件；**首次启动建库由跨进程文件锁串行化、并带有界重试**（见
-  [§3.2](#32-全新数据卷初始化竞态复核)），跨进程的追加发布则由 `BEGIN IMMEDIATE`
-  事务串行化，可直接按 [§4.2](#42-发布新版本乐观并发控制) 末尾的并发命令复核竞态
+  SQLite 文件；**首次启动建库由跨进程文件锁（非阻塞取锁）串行化、并带有界重试**
+  （见 [§3.2](#32-全新数据卷初始化竞态复核)），跨进程的追加发布则由 `BEGIN IMMEDIATE`
+  事务串行化，可直接按 [§4.2](#42-发布新版本乐观并发控制) 末尾的并发命令复核竞态；
+  若另一进程持续占住建库锁，worker 不会悬挂，而是在退避预算耗尽后明确失败退出
+  （见 [§3.3](#33-持锁与解锁复核)）
 
 常用命令：
 
@@ -98,9 +100,14 @@ export VT_DB_PATH=./data/tiles.db          # SQLite 文件路径
 两个 worker 在全新卷上同时执行 lifespan 建库时，`PRAGMA busy_timeout` 会在
 `PRAGMA journal_mode=WAL` **之前**安装；建库 DDL 全部使用
 `CREATE TABLE/INDEX IF NOT EXISTS`，并由容器内 `/data/tiles.db.init.lock` 上的
-排他文件锁（`flock`）串行化，外加最多 8 次、指数退避（0.1 s 起，上限 2 s）的有界
-重试，最后重新打开连接复核 WAL 模式与全部 schema 对象均可见。因此两个 worker 都会
-完整启动、建同一份 schema 且不重复建表。
+**非阻塞**排他文件锁（`flock(LOCK_EX | LOCK_NB)`）串行化。取锁失败（锁被另一
+进程持有）与 SQLite 的 `database is locked` **共用同一份重试预算**：最多
+`VT_INIT_MAX_ATTEMPTS` 次（默认 8）尝试，指数退避（0.1 s 起，上限 2 s）；拿到锁后
+仍在锁内串行建库，建库过程中发生异常会在重试前释放已获取的锁；每次尝试最后重新
+打开连接复核 WAL 模式与全部 schema 对象均可见。因此只要持锁在预算内释放，两个
+worker 都会完整启动、建同一份 schema 且不重复建表；锁被持续占住时则在预算耗尽后
+抛出 `SchemaUnavailable` 结束启动，绝不阻塞在 `flock` 上（复核见
+[§3.3](#33-持锁与解锁复核)）。
 
 **第 1 步：在全新数据卷上一键启动**（`down -v` 确保卷是空的）：
 
@@ -208,6 +215,143 @@ round 3: healthz=200 locked_errors=0
 初始化相关参数也可以用环境变量调整（见 [§7](#7-配置环境变量)）：
 `VT_SQLITE_BUSY_TIMEOUT_MS`（默认 30000）、`VT_INIT_MAX_ATTEMPTS`（默认 8）、
 `VT_INIT_RETRY_DELAY_S`（默认 0.1）。
+
+### 3.3 持锁与解锁复核
+
+复核目标：当**另一个进程持续持有** `/data/tiles.db.init.lock` 排他锁时，worker
+经 lifespan → `init_db` → `_init_file_lock` **不会**阻塞在老式阻塞式 `flock` 上，
+而是非阻塞试锁（`LOCK_EX | LOCK_NB`）失败后走与 SQLite 忙锁共用的退避预算；预算
+耗尽即抛出 `SchemaUnavailable` 明确结束启动（uvicorn 进程退出、容器进入重启策略），
+不悬挂。持锁进程在预算内释放后重启服务，两个 worker 串行建出同一份完整 schema，
+`/healthz` 稳定返回 200，发布 / 追加 / 历史瓦片 API 全部可调用。
+
+Compose 内置一个只做持锁的辅助服务 `lock-holder`（挂在 `lock-test` profile 下，
+普通 `docker compose up` 不会启动它），它用阻塞式 `flock(LOCK_EX)` 模拟“持续占锁的
+另一进程”。
+
+**第 1 步：全新卷上先让持锁者拿到锁，再启动 API**：
+
+```bash
+docker compose --profile lock-test down -v   # 删除旧卷，模拟全新数据盘
+docker compose --profile lock-test run -d --name lock-holder lock-holder
+docker compose logs lock-holder | grep "flock held"
+```
+
+```text
+lock-holder: exclusive flock held on /data/tiles.db.init.lock
+```
+
+```bash
+docker compose up -d vector-tiles
+```
+
+**第 2 步：约 8 秒（0.1+0.2+0.4+0.8+1.6+2.0+2.0 s 退避）后确认 worker 明确失败、
+进程退出而不是挂起**——两个 worker 的日志里都有 `SchemaUnavailable`，并指明锁正被
+其他进程持有；容器按 `restart: unless-stopped` 反复重启、反复快速失败：
+
+```bash
+sleep 10
+docker compose logs vector-tiles | grep -E "SchemaUnavailable|init lock held" | sort -u
+docker compose ps
+```
+
+```text
+app.db.SchemaUnavailable: database initialisation failed after 8 attempts: init lock held by another process: /data/tiles.db.init.lock
+NAME                      STATUS
+offline-vector-tile-api   Restarting (1) ...
+```
+
+此时 HTTP 请求无响应（worker 从未完成启动，端口无人监听），但启动流程是**有界
+结束**的，不存在无限等待：
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" --max-time 3 http://localhost:8000/healthz
+```
+
+```text
+000
+```
+
+> 想更快观察失败，可在 `docker-compose.yml` 里把 `VT_INIT_MAX_ATTEMPTS` 临时调小
+> （如 `2`）后 `docker compose up -d --build`。
+
+**第 3 步：释放锁并重启 API**（`restart` 停止持锁容器即释放 `flock`）：
+
+```bash
+docker rm -f lock-holder
+docker compose restart vector-tiles
+```
+
+**第 4 步：两个 worker 完成启动、看到同一完整 schema，`/healthz` 稳定 200**：
+
+```bash
+sleep 3
+docker compose logs vector-tiles | grep -c "Application startup complete"   # 2
+
+for i in $(seq 1 5); do
+  curl -s -o /dev/null -w "%{http_code} " http://localhost:8000/healthz
+done; echo
+curl -s http://localhost:8000/healthz; echo
+```
+
+```text
+2
+200 200 200 200 200
+{"status":"ok"}
+```
+
+```bash
+docker compose exec vector-tiles python - <<'EOF'
+import sqlite3
+conn = sqlite3.connect("/data/tiles.db")
+print("journal_mode =", conn.execute("PRAGMA journal_mode").fetchone()[0].lower())
+print("objects =", [r[0] for r in conn.execute(
+    "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name")])
+print("duplicates =", conn.execute(
+    "SELECT name FROM sqlite_master GROUP BY name HAVING COUNT(*) > 1").fetchall())
+EOF
+```
+
+```text
+journal_mode = wal
+objects = ['datasets', 'idx_tile_cache_rev', 'revisions', 'tile_cache']
+duplicates = []
+```
+
+**第 5 步：解锁后发布、追加修订、读取历史瓦片的 HTTP API 均可调用**：
+
+```bash
+# 发布 revision 1
+DS=$(curl -s -X POST http://localhost:8000/datasets \
+  -F "file=@data/sample.geojson;type=application/geo+json" \
+  -F "layer=demo" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+echo "dataset=$DS"
+
+# 追加 revision 2
+curl -s -o /dev/null -w "append revision 2: %{http_code}\n" \
+  -X POST "http://localhost:8000/datasets/$DS/revisions" \
+  -F "file=@data/sample.geojson;type=application/geo+json" \
+  -F "expected_revision=1"
+
+# 历史 revision 1 的瓦片仍可读取（x-revision: 1，immutable 缓存）
+curl -s -D - -o /dev/null \
+  "http://localhost:8000/datasets/$DS/tiles/0/0/0.mvt?revision=1" \
+  | grep -iE "^HTTP|x-revision|cache-control"
+```
+
+```text
+dataset=7f4c9d0b2a6e4f1c9b8d7e6f5a4b3c2d
+append revision 2: 201
+HTTP/1.1 200 OK
+x-revision: 1
+cache-control: public, max-age=31536000, immutable
+```
+
+复核结束清理：
+
+```bash
+docker compose --profile lock-test down -v
+```
 
 ---
 
@@ -524,8 +668,8 @@ ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务
 | `VT_HOST` / `VT_PORT` | `0.0.0.0` / `8000` | 监听地址与端口 |
 | `VT_MIN_ZOOM` / `VT_MAX_ZOOM` | `0` / `14` | 允许编译的缩放级别范围 |
 | `VT_MAX_UPLOAD_BYTES` | `52428800` | 单次上传大小上限（50 MB） |
-| `VT_WORKERS` | `2`（Docker） | uvicorn 工作进程数；多进程共享同一 SQLite 文件，首次建库与追加发布分别由文件锁和跨进程事务串行化 |
+| `VT_WORKERS` | `2`（Docker） | uvicorn 工作进程数；多进程共享同一 SQLite 文件，首次建库与追加发布分别由非阻塞文件锁（+有界重试）和跨进程事务串行化 |
 | `VT_TILE_CACHE_SIZE` | `4096` | 进程内瓦片 LRU 缓存条目数 |
 | `VT_SQLITE_BUSY_TIMEOUT_MS` | `30000` | SQLite 忙等待（busy handler）毫秒数；连接建立后、切换 WAL 之前生效 |
-| `VT_INIT_MAX_ATTEMPTS` | `8` | lifespan 建库遇到瞬时锁错误时的有界重试次数 |
-| `VT_INIT_RETRY_DELAY_S` | `0.1` | 建库重试的初始退避秒数（指数翻倍，上限 2 秒） |
+| `VT_INIT_MAX_ATTEMPTS` | `8` | lifespan 建库的有界尝试次数；**文件锁非阻塞取锁失败与 SQLite 忙锁共用这一预算**，耗尽后抛 `SchemaUnavailable` 结束启动（不悬挂） |
+| `VT_INIT_RETRY_DELAY_S` | `0.1` | 建库重试的初始退避秒数（指数翻倍，上限 2 秒；文件锁被占用与数据库忙均按此退避） |

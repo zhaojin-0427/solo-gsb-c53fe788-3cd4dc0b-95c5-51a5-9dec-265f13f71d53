@@ -15,6 +15,11 @@ services:
       # Two independent uvicorn worker processes share the SQLite file so the
       # cross-process append-revision race can be reproduced via the HTTP API.
       VT_WORKERS: "2"
+      # Non-blocking .init.lock + bounded retry budget shared with SQLite busy
+      # errors.  An external holder that never releases makes lifespan raise
+      # SchemaUnavailable and exit instead of hanging on flock.
+      VT_INIT_MAX_ATTEMPTS: "8"
+      VT_INIT_RETRY_DELAY_S: "0.1"
     volumes:
       - tile-data:/data
     restart: unless-stopped
@@ -26,6 +31,35 @@ services:
       # Both workers serialise first-touch schema setup behind a file lock
       # (plus bounded retry); give the second worker room to finish.
       start_period: 15s
+
+  # One-command "stubborn other process" for the lock review:
+  #   docker compose --profile lock-test run --rm -d lock-holder
+  # takes a *blocking* exclusive flock on /data/tiles.db.init.lock and holds
+  # it until the container is removed, so vector-tiles' non-blocking attempts
+  # fail fast and (after VT_INIT_MAX_ATTEMPTS) end startup with
+  # SchemaUnavailable.  Stop it with `docker compose stop lock-holder` (or
+  # `docker rm -f`) to release the lock; restart: unless-stopped then brings
+  # the API back up.  Attached to a dedicated profile so ordinary
+  # `docker compose up` never starts it.
+  lock-holder:
+    image: offline-vector-tile-api:latest
+    build: .
+    profiles: ["lock-test"]
+    entrypoint: ["python", "-c"]
+    command:
+      - |
+        import fcntl, os, time
+        path = os.environ["VT_DB_PATH"] + ".init.lock"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            print(f"lock-holder: exclusive flock held on {path}", flush=True)
+            while True:
+                time.sleep(3600)
+    environment:
+      VT_DB_PATH: /data/tiles.db
+    volumes:
+      - tile-data:/data
 
 volumes:
   tile-data:
